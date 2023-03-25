@@ -1,1 +1,666 @@
 
+
+// Code executes on both ESP01 and D1 mini without any changes (mini easier development)
+// RTC will turn on power to system by raising Multifunction Pin (EN to XC6220)
+// executing setAlarm() will lower EN and turn off power (unless connected to USB/debug)
+// setMPF(HIGH) will lock EN pin high to keep pwr on until seAlarm() turns pwr off
+// cannot use led and TX at same time on ESP-01
+// Current ~80mA with occasional pop ~100mA D1 mini
+// typ on time ~5 seconds
+// ESP8266 Vcc 2.5min, 3.6 max
+
+// 0301 basic structure
+// 0302 use same wire.begin for esp01 & mini
+// 0303 calibrated
+// 0306 increase update rate, save ctrl
+// 0308 cal esp01, add vcc check and fallback to longer sample period, vout float, temp F
+// 0310 reorganize setup()
+// 0311 change to local Pi mqtt
+// 0312 ctrl=powerofftime, mqtt->hive
+
+//                  D1 Mini Pinout
+//                  +-----------+
+//                  | ___     _ |
+//                  | |  |  |   |
+//                  | |  |__|   |
+//    RESET         |O RST  TX O| GPIO1 TXD0
+//    ADC0          |O A0   RX O| GPIO3 RXD0
+//    WAKE  GPIO16  |O D0   D1 O| GPIO5 SCL
+//    SCLK  GPIO14  |O D5   D2 0| GPIO4 SDA
+//    MISO  GPIO12  |O D6   D3 O| GPIO0 FLASH use as SDA
+//    MOSI  GPIO13  |O D7   D4 O| GPIO2       use as SCL
+//    CS    GPIO15  |O D8   G  O| GND
+//    3.3V          |O      5V O| 5V
+//                  +-----------+
+
+//               ESP-01
+//              CONNECTOR
+//              +-------+
+//    TX  GPIO1 [O]   [O] GND
+//    EN        [O]   [O] GPIO2 (SCL)
+//    RST       [O]   [O] GPIO0 {SDA)
+//    3.3V      [O]   [O] RX GPIO3
+//              +-------+
+
+
+#include <Wire.h>               // Standard I2C "Wire" library, note special pins
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include "NTPClient.h"
+#include "time.h"
+#include "WiFiUdp.h"
+
+#define TOPIC_CTRL  "ss/ctrl"   // topic: outdoor control
+#define TOPIC_TOUT  "ss/tout"   // topic: outdoor temperature
+#define TOPIC_POUT  "ss/pout"   // topic: outdoor pressure
+#define TOPIC_VOUT  "ss/vout"   // topic: outdoor vcc
+#define MSG_BUFFER_SIZE (50)    // incoming message buffer
+
+const char* mqtt_server = "broker.hivemq.com";
+//const char* mqtt_server = "192.168.0.40";  // Pi url
+//const char broker[] = "test.mosquitto.org";
+const long  utcOffset = -7*3600;  // time zone in sec
+
+WiFiClient espClient;
+PubSubClient MQTTclient(mqtt_server, 1883, espClient);
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffset);
+
+const char* ssid = "Flyingeye";
+const char* password = "7192218822";
+const char* ntpServer = "pool.ntp.org";// time server
+char      msg[MSG_BUFFER_SIZE];
+char      daysOfTheWeek[7][12] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+int16_t   daylightOffsetSec = 0;// daylight offset (seconds)
+uint16_t  updateInterval = 2;   // seconds between updates
+boolean   newMessage = false;   // new MQTT message flag
+uint16_t  ctrl;                 // not used for much - increments each message
+float     tout;                 // outdoor temp as read from sensor
+float     pout;                 // outdoor pressure
+float     vout;                 // Vcc on outdoor unit
+uint16_t  hours;                // used by timeClient
+uint16_t  minutes;              // to determine time of day
+uint16_t  seconds;              // could be used to adjust sample rate
+uint16_t  day;                  // less samples after dark
+uint16_t  RTCseconds;           // used by RTC
+uint16_t  lastSeconds;          // used to control print of seconds
+uint16_t  pwrOnTime   = 22;     // not used, pgm will self-terminate when complete
+uint16_t  pwrOffTime  = 10;     // time for next wakeup, might change if bat low
+uint16_t  PWROFFTIME1 = 60;     // time for next wakeup, low bat condition 1
+uint16_t  PWROFFTIME2 = 600;    // time for next wakeup, low bat condition 2
+uint16_t  PWROFFTIME3 = 3600;   // time for next wakeup, low bat condition 3
+float     VCCTHRES1   = 3.15;   // Vcc threshold to begin power saving
+float     VCCTHRES2   = 3.05;   // threshold to begin more power saving
+float     VCCTHRES3   = 3.00;   // threshold to begin more power saving
+float     ta;                   // individual temperature sample, sensor a
+float     tb;                   // individual temperature sample, sensor b
+float     pa;                   // individual pressure sample, sensor a
+float     pb;                   // 
+float     Pa;                   // averaged pressure over N samples, BMP 1
+float     Pb;                   // averaged pressure over N samples, BMP 2
+float     taCal = -4.0;         // temperature cal, added to measurement
+float     tbCal = 0;            // tb not used
+float     paCal = 0;            // added to measurement
+float     pbCal = 1;            // 
+float     Vcal = .9469;         // Vcc cal, must be calibrated for individual ESP01
+uint16_t  samples = 0;          // numnber of pressure samples
+
+ADC_MODE(ADC_VCC);              // weird statement - just hanging 
+// ----------------------- Setup -------------------------------
+void setup() {
+  setupSerial();                // start Serial
+  WiFi.mode(WIFI_STA);          // mode=station, not adapter
+  WiFi.begin(ssid, password);   // start WiFi connection
+  Wire.begin(0,2);              // Initialize I2C (SDA = GPIO0, SCL = GPIO2)
+  RTCsetMFP(HIGH);              // lock MFP , disable alarm, zero clock, start clock
+  initBaro();                   // init & read compensation values
+  connectWiFi();                // establish wifi connection, read & ave baro readings
+  monitorVcc();                 // get Vcc & adjust next sample time
+  ctrl = pwrOffTime;            // send time to next message
+  setupTime();                  // time is not currently used, could adjust sample rate
+  setupMQTT();                  // start MQTT
+  Serial.print("mS power on ");  // time to here
+  Serial.println(millis());     // milliseconds since power on
+  RTCsetAlarm(pwrOffTime);      // this turns power off
+  delay(100);                   // hang while pwr dies
+}
+
+// ------------------------ Main ----------------------------
+void loop() {                       // all the rest is eye candy,
+  RTCseconds = RTCreadSec();        // during operation via USB
+  if(RTCseconds>lastSeconds) {      // because power off in setup()
+    lastSeconds = RTCseconds;       // loop() never executes
+    Serial.print(RTCseconds);
+    Serial.print(" ");
+  }
+  if(RTCseconds>pwrOnTime) {        // only executes when USB power
+    RTCsetAlarm(pwrOffTime);        // MFP goes low, but pwr still on because USB
+//    ESP.restart();                // reset
+  }
+}
+
+// ----------------------------- MQTT --------------------------------------------------
+void callback(char* topic, byte* payload, unsigned int length) {
+  byte lastChar;                    // toggle led based on last char of msg
+  newMessage = true;                // received new msg via MQTT
+  Serial.print("Incoming: [");      // msg has arrived
+  Serial.print(topic);              // topic
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]); // print each char of string
+    lastChar = payload[i];          // keep last char of msg
+  }
+  Serial.println();
+}
+
+String MQTTclientId   = "ESP8266-";
+String MQTTclientUser = "stevensarns";
+String MQTTclientPw   = "Fe615243!";
+void reconnect() {
+  while (!MQTTclient.connected()) {       // connect if not connected
+    Serial.print("MQTT connection...");   // wait for connection
+    MQTTclientId += String(random(0xffff), HEX);// randomize id
+    if (MQTTclient.connect(MQTTclientId.c_str())) {
+      Serial.println("connected");        // ok
+      MQTTclient.subscribe(TOPIC_CTRL);   // receive any messages sent to xxx/ctrl (by self!)
+    }                                     // receive back ctrl msg I just sent (useful debug)
+    else {                                // fail
+      Serial.print("failed, rc=");        // get fail code
+      Serial.print(MQTTclient.state());   // report errors
+      Serial.println(" wait 5 seconds");  // wait
+      delay(5000);                        // good luck
+    }
+  }
+}
+
+void  setupMQTT() {
+  MQTTclient.setServer(mqtt_server, 1883);
+  MQTTclient.setCallback(callback); // routine for received msg
+  reconnect();                  // connect
+  MQTTclient.loop();            //
+  MQTTclient.publish(TOPIC_CTRL, String(ctrl).c_str());// convert to string
+  MQTTclient.publish(TOPIC_TOUT, String(tout).c_str());
+  MQTTclient.publish(TOPIC_POUT, String(pout).c_str());
+  MQTTclient.publish(TOPIC_VOUT, String(vout).c_str());
+  Serial.print("Outgoing: ");
+  Serial.println(ctrl);             // sample sent data
+  Serial.print("mS to here ");      // time since power on
+  Serial.println(millis());
+  while(!newMessage) {              // has new ctrl data arrived?
+    MQTTclient.loop();              // wait for incoming msg
+  }
+}
+
+// ----------------------------- MCP7940 RTC ------------------------------
+// 0  RTCSEC  ST      SECTEN2 SECTEN1 SECTEN0 SECONE3 SECONE2 SECONE1 SECONE0
+// 1  RTCMIN  ------  MINTEN2 MINTEN1 MINTEN0 MINONE3 MINONE2 MINONE1 MINONE0
+// 2  RTCHOUR ------  12/24   HRTEN1  HRTEN0  HRONE3  HRONE2  HRONE1  HRONE0
+// 3  RTCWKDAY -----  ------  OSCRN   ------  ------  WKDAY2  WKDAY1  WKDAY0
+// 4  RTCDATE ------  ------  DATET1  DATET0  DATEO3  DATEO2  DATEO1  DATEO0
+// 5  RTCMTH  ------  ------  LPYR    MNTHT0  MNTHO3  MNTHO2  MNTHO1  MNTHO0
+// 6  RTCYR   YRTEN3  YRTEN2  YRTEN1  YRTEN0  YRONE3  YRONE2  YRONE1  YRONE0
+// 7  CONTROL OUT     SQWEN   ALM1EN  ALM0EN  EXTOSC  CRSTRIM SQWFS1  SQWFS0
+// 8  OSCTRIM SIGN    TRIM6   TRIM5   TRIM4   TRIM3   TRIM2   TRIM1   TRIM0
+
+// A  ALM0SEC ------  SECTEN2 SECTEN1 SECTEN0 SECONE3 SECONE2 SECONE1 SECONE0
+// B  ALM0MIN ------  MINTEN2 MINTEN1 MINTEN0 MINONE3 MINONE2 MINONE1 MINONE0
+// C  ALM0HOUR -----  12/24   HRTEN1  HRTEN0  HRONE3  HRONE2  HRONE1  HRONE0
+// D  ALM0WKDAY ALMPOL A0MSK2 A0MSK1  A0MSK0  ALM0IF  WKDAY2  WKDAY1  WKDAY0
+// E  ALM0DATE ------ ------  DATET1  DATET0  DATEO3  DATEO2  DATEO1  DATEO0
+// F  ALM0MTH  -----  ------  ----    MNTHT0  MNTHO3  MNTHO2  MNTHO1  MNTHO0
+
+// 11 ALM1SEC ------  SECTEN2 SECTEN1 SECTEN0 SECONE3 SECONE2 SECONE1 SECONE0
+// 12 ALM1MIN ------  MINTEN2 MINTEN1 MINTEN0 MINONE3 MINONE2 MINONE1 MINONE0
+// 13 ALM1HOUR -----  12/24   HRTEN1  HRTEN0  HRONE3  HRONE2  HRONE1  HRONE0
+// 14 ALM1WKDAY ----- A1MSK2  A1MSK1  A1MSK0  ALM1IF  WKDAY2  WKDAY1  WKDAY0
+// 15 ALM1DATE ------ ------  DATET1  DATET0  DATEO3  DATEO2  DATEO1  DATEO0
+// 16 ALM1MNTH -----  ------  ----    MNTHT0  MNTHO3  MNTHO2  MNTHO1  MNTHO0
+
+// 20 MEMORY to 5F (64 bytes)       // 32 ints, only two used
+
+byte const RTC_ADDR   = 0x6F;       // MCP7940 i2c address
+byte const RTCSEC     = 0x00;       // seconds register address
+byte const ALM0SEC    = 0x0A;       // alarm0 register address
+byte const ALM1SEC    = 0x11;       // alarm1
+byte const ALM0WKDAY  = 0x0D;       // contains alarm polarity and interrupt flag
+byte const CONTROL    = 0x07;       // control register address
+byte const MEMORY     = 0x20;       // start of user memory
+
+long RTCreadSec() {                 // total seconds since power on, max = 86399
+  long unsigned  sec;               // total seconds=hours x 3600 + min x 60 + seconds
+  byte reg0;                        // seconds
+  byte reg1;                        // minutes
+  byte reg2;                        // hours
+  Wire.beginTransmission(RTC_ADDR); // Address the MCP7940 device
+  Wire.write(0);                    // Send register address to read from
+  if(Wire.endTransmission()==0) {  
+    Wire.requestFrom(RTC_ADDR, 3);  // Request a block of data
+    reg0 = Wire.read();             // Read a byte
+    reg1 = Wire.read();             // Read a byte
+    reg2 = Wire.read();             // Read a byte
+  }                                 // do not insert endTransmission()
+  reg0 = reg0 & 0x7F;               // mask off start oscillator bit
+  sec  = bcd2bin(reg0);             // convert to binary
+  sec  += 60*bcd2bin(reg1);         // add minutes
+  sec  += 60*bcd2bin(reg2);         // add hours
+  return sec;                       // returns seconds < 86399
+}
+
+int RTCreadAlarm() {
+  long sec;                         // time in seconds
+  byte reg0;                        // alarm sec
+  byte reg1;                        // alarm min
+  byte reg2;                        // alarm hours
+  Wire.beginTransmission(RTC_ADDR); // Address the MCP7940 device
+  Wire.write(ALM0SEC);              // Send register address to read from
+  if(Wire.endTransmission()==0) {  
+    Wire.requestFrom(RTC_ADDR, 3);  // Request a block of data
+    reg0 = Wire.read();             // Read a byte sec
+    reg1 = Wire.read();             // Read a byte min
+    reg2 = Wire.read();             // Read a byte hours
+  }                                 // do not insert endTransmission()
+  reg0 = reg0 & 0x7F;               // mask off start oscillator bit
+  sec  = bcd2bin(reg0);             // convert to binary
+  sec  += 60*bcd2bin(reg1);         // add minutes
+  sec  += 60*bcd2bin(reg2);         // add hours
+  return sec;
+}
+
+// -----------------------------set MFP ---------------------------
+// routine may be redundant - MFP is not cleared until flag cleared in ALM0WKDAY
+// but this is more definite
+// RTC will run, but time is only used during debug because setAlarm() at end of setup()
+void RTCsetMFP(int level) {         // set MFP hi/lo and turn off alarm, RTC runs
+  Wire.beginTransmission(RTC_ADDR); // Address the MCP7940 device
+  Wire.write(CONTROL);              // Send register address, control    
+  if(level) Wire.write(0x80);       // set hi
+  else      Wire.write(0);          // set low
+  Wire.endTransmission();           // alarm is off in either case
+  
+  Wire.beginTransmission(RTC_ADDR); // Address the MCP7940 device
+  Wire.write(RTCSEC);               // Send register address, seconds,
+  Wire.write(0x80);                 // bit7-start RTC running, zero seconds
+  Wire.write(0);                    // zero minutes
+  Wire.write(0);                    // zero hours
+  Wire.endTransmission();           // start clock oscillator if not already running
+}
+
+// -------------------------- set alarm -----------------------------------
+// MFP (alarm) pin has gone high->turning on pwr to this board
+// power will remain on until ALM0IF flag is cleared (ALM0WKDAY register)
+// first-> set MFP pin high by taking direct control of MFP
+// program all registers
+// last -> enable alarm0, releasing direct control and control MFP by alarm0 registers
+// RTCsetMFP() has latched MFP high, above is obsolete
+
+void RTCsetAlarm(long unsigned interval) {// set interval in seconds  
+  if(interval>86399) interval = 86399; // limit to 23:59:59
+  byte hours = interval/3600;       // hours
+  interval = interval%3600;         // remaining seconds
+  byte minutes  = interval/60;      // minutes
+  byte seconds = interval%60;       // seconds
+  byte reg0 = ((seconds/10)<<4) + seconds%10; // seconds in bcd
+  byte reg1 = ((minutes/10)<<4) + minutes%10; // minutes in bcd
+  byte reg2 = ((hours/10  )<<4) + hours%10;   // hours in bcd
+  
+  Wire.beginTransmission(RTC_ADDR); // Address the MCP7940 device
+  Wire.write(ALM0SEC);              // Send register address, alarm 0 seconds
+  Wire.write(reg0);                 // A - alarm0 seconds
+  Wire.write(reg1);                 // B - minutes
+  Wire.write(reg2);                 // C - hours, next reg ALM0WKDAY, msb is alarm polarity
+  Wire.write(0x80);                 // D - alarm polarity, 80->active high, 00->active low
+  Wire.endTransmission();           // RTCsetMFP() depends on polarity bit=1
+
+  Wire.beginTransmission(RTC_ADDR); // Address the MCP7940 device
+  Wire.write(RTCSEC);               // Send register address, seconds,
+  Wire.write(0x80);                 // bit7-start clk
+  Wire.endTransmission();           // start clock oscillator
+  
+  Wire.beginTransmission(RTC_ADDR); // Address the MCP7940 device
+  Wire.write(CONTROL);              // Send register address, control
+  Wire.write(0x10);                 // bit4->alrm0 en
+  Wire.endTransmission();           // enable alarm (which will turn off power to this board)
+}
+
+// --------------------- RTC battery backed RAM -------------------
+void RTCwriteBBramInt(byte addr, uint16_t data) {
+  Wire.beginTransmission(RTC_ADDR); // Address the I2C device
+  Wire.write(MEMORY+addr);          // Send register address to write to
+  Wire.write(data>>8);              // write unsigned int msb
+  Wire.write(data & 255);           // write lsb
+  Wire.endTransmission(); 
+}
+
+uint16_t RTCreadBBramInt(byte addr) {
+  uint16_t data;
+  Wire.beginTransmission(RTC_ADDR); // Address the I2C device
+  Wire.write(MEMORY+addr);          // Send register address to read from
+  if(Wire.endTransmission()==0) {   // endTransmission is here  <---
+    Wire.requestFrom(RTC_ADDR, 2);  // Request a block of data     |
+    data = Wire.read();             // Read byte msb               |
+    data = (data<<8) | Wire.read(); // Read byte lsb               |
+  }                                 // do not insert endTransmission()
+  return data;
+}
+
+// -------------- Convert Binary Coded Decimal to Hex ------------
+byte bcd2bin(byte bcd) { 
+  byte decByte;                       
+  decByte = (bcd>>4) * 10;
+  decByte = decByte + (bcd & 0x0F);
+  return decByte;
+}
+
+// --------------------------- BMP280 -------------------------------
+// these are globals because read during initBaro and used during readBaro
+uint16_t    dig_T1a;           // temperature correction factors
+int16_t     dig_T2a;
+int16_t     dig_T3a;
+uint16_t    dig_P1a;           // presssure correction factors
+int16_t     dig_P2a;           // correction factors
+int16_t     dig_P3a;           // stored in sensor
+int16_t     dig_P4a;
+int16_t     dig_P5a;
+int16_t     dig_P6a;
+int16_t     dig_P7a;
+int16_t     dig_P8a;
+int16_t     dig_P9a;
+
+uint16_t    dig_T1b;           // temperature correction factors
+int16_t     dig_T2b;
+int16_t     dig_T3b;
+uint16_t    dig_P1b;           // presssure correction factors
+int16_t     dig_P2b;           // correction factors
+int16_t     dig_P3b;           // stored in sensor
+int16_t     dig_P4b;
+int16_t     dig_P5b;
+int16_t     dig_P6b;
+int16_t     dig_P7b;
+int16_t     dig_P8b;
+int16_t     dig_P9b;
+
+// ------------------------ Temperature & Pressure ---------------------------
+void readBaro() {
+  byte  const TEMP_DATA  = 0xFA;    // starting address of temperature data
+  byte  const PRES_DATA  = 0xF7;    // start addr of pressure data
+  int32_t  adc_T;                   // raw press data from sensor, shifted to right
+  int32_t  adc_P;                   // raw temp data from sensor shft rt
+  byte addr;                        // BMP280 I2C address
+  addr = 0x76;                      // x76
+  Wire.beginTransmission(addr);     // read raw pressure data
+  Wire.write(TEMP_DATA);            // Send register address to read from
+  if(Wire.endTransmission()==0) {  
+    Wire.requestFrom(addr, 3);      // Request a block of data
+      adc_T = ((Wire.read()<<16) | (Wire.read()<<8) | Wire.read());
+      adc_T = adc_T >> 4;           // shift right, result is 20 bits
+  }
+  Wire.beginTransmission(addr);     // read pressure registers
+  Wire.write(PRES_DATA);            // Send register address to read from
+  if(Wire.endTransmission()==0) {  
+    Wire.requestFrom(addr, 3);      // Request a block of data
+      adc_P = ((Wire.read()<<16) | (Wire.read()<<8) | Wire.read());
+      adc_P = adc_P>>4;             // last byte is 4 msbs
+  }
+  float var1 = (adc_T/16384. - dig_T1a/1024.) * dig_T2a;
+  float var2 = (adc_T/131072. - dig_T1a/8192.) *  (adc_T/131072. - dig_T1a/8192.) *  dig_T3a;
+  float t_fine = var1 + var2;
+  ta  = (t_fine)/5120.;
+  ta  = 9.*ta/5.+32.+taCal;
+  
+  var1 = t_fine/2. - 64000;
+  var2 = var1 * var1 *  dig_P6a/32768.;
+  var2 = var2 + var1 *  dig_P5a *2;
+  var2 = var2/4. +  dig_P4a*65536.;
+  var1 = (dig_P3a * var1 * var1 / 524288. + var1 *  dig_P2a) / 524288.;
+  var1 = (1. + var1/32768.) *  dig_P1a;
+  pa = 1048576. - adc_P;
+  pa = (pa - (var2/4096.)) * 6250. / var1;
+  var1 =  dig_P9a * pa / 2147483648. * pa;  
+  var2 = pa *  dig_P8a / 32768.;
+  pa = pa + (var1 + var2 +  dig_P7a)/16.;
+  pa = pa/100.;                     // pressure in Pa
+  pa = pa + paCal;
+  
+  addr = 0x77;
+  Wire.beginTransmission(addr);     // read raw pressure data
+  Wire.write(TEMP_DATA);            // Send register address to read from
+  if(Wire.endTransmission()==0) {   // I2C
+    Wire.requestFrom(addr, 3);      // Request a block of data
+      adc_T = ((Wire.read()<<16) | (Wire.read()<<8) | Wire.read());
+      adc_T = adc_T >> 4;           // shift right, result is 20 bits
+  }
+  Wire.beginTransmission(addr);     // read pressure registers
+  Wire.write(PRES_DATA);            // Send register address to read from
+  if(Wire.endTransmission()==0) {  
+    Wire.requestFrom(addr, 3);      // Request a block of data
+      adc_P = ((Wire.read()<<16) | (Wire.read()<<8) | Wire.read());
+      adc_P = adc_P>>4;             // last byte is 4 msbs
+  }
+  var1 = (adc_T/16384. - dig_T1b/1024.) *  dig_T2b;
+  var2 = (adc_T/131072. - dig_T1b/8192.) * (adc_T/131072. - dig_T1b/8192.) *  dig_T3b;
+  t_fine = var1 + var2;
+  tb  = (t_fine)/5120.;
+  tb  = tb + tbCal;
+  
+  var1 = t_fine/2. - 64000;
+  var2 = var1 * var1 *  dig_P6b/32768.;
+  var2 = var2 + var1 *  dig_P5b *2;
+  var2 = var2/4. +  dig_P4b*65536.;
+  var1 = (dig_P3b * var1 * var1 / 524288. + var1 *  dig_P2b) / 524288.;
+  var1 = (1. + var1/32768.) *  dig_P1b;
+  pb = 1048576. - adc_P;
+  pb = (pb - (var2/4096.)) * 6250. / var1;
+  var1 =  dig_P9b * pb / 2147483648. * pb;  
+  var2 = pb *  dig_P8b / 32768.;
+  pb = pb + (var1 + var2 +  dig_P7b)/16.;
+  pb = pb/100.;                     // pressure in Pa
+  pb = pb + pbCal;
+}
+
+// ---------------------------- BMP support --------------------------
+uint16_t filter=50;
+void averageSamples() {
+  Pa = (pa + (filter-1)*Pa)/filter;
+  Pb = (pb + (filter-1)*Pb)/filter;
+}
+
+void validateSample() {
+  uint16_t Pstore;
+  Pstore = RTCreadBBramInt(0);      //  read last sensor data
+  Serial.print("Last pressure ");
+  Serial.print(Pstore/10);
+  Serial.print(".");
+  Serial.println(Pstore%10);
+  if(abs(Pa-Pb)/((Pa+Pb)/2) < .001) {
+    pout = (Pa+Pb)/2;               // if diff <.1%, use average
+  }
+  else {                            // if diff >.1% use closest to last sample
+    if((abs(Pstore-Pa*10))>(abs(Pstore-Pb*10))) pout = Pb;
+    else                                        pout = Pa;
+    if(isnan(pout)) pout = 1000;
+    Serial.println("Pressure discrepancy!");
+  }
+  Serial.print("This Pressure ");
+  Serial.print(pout);
+  Serial.println();
+  Pstore = 10*pout;                   // store 10x to get 4 significant digits
+  RTCwriteBBramInt(0, Pstore);        // store sameple in location 0
+}
+
+// -------------------- Init BMP280 -----------------------------
+// CONFIG T_SB2 T_SB1 T_SB0 FILT2 FILT1 FILT0 ----- SPI_EN  
+// CONTRL  OSRT2 OSRT1 OSRT0 OSRS2 OSRS1 OSRS0 MODE1 MODE0
+void initBaro() {
+  byte  const BARO_CONFIG = 0xF5;   // pointer to config register
+  byte  const BARO_CTRL   = 0xF4;   // pointer to control register
+  byte const configVal = B00010000; // t_sb=000(.5ms), filter=100, spi_en=0
+  byte const ctrlVal   = B01110011; // osrt=011(x4), osrs=100(8x), MODE=11(normal)
+  byte addr;
+  addr = 0x76;
+  Wire.beginTransmission(addr);     // Address the I2C device
+  Wire.write(BARO_CONFIG);          // write reg to write to
+  Wire.write(configVal);            // write data to reg
+  Wire.endTransmission();
+  Wire.beginTransmission(addr);     // Address the I2C device
+  Wire.write(BARO_CTRL);            // Send register address to write to 
+  Wire.write(ctrlVal);              // write data to register
+  Wire.endTransmission();           // end
+  
+  addr = 0x77;
+  Wire.beginTransmission(addr);     // Address the I2C device
+  Wire.write(BARO_CONFIG);          // write reg to write to
+  Wire.write(configVal);            // write data to reg
+  Wire.endTransmission();
+  Wire.beginTransmission(addr);     // Address the I2C device
+  Wire.write(BARO_CTRL);            // Send register address to write to 
+  Wire.write(ctrlVal);              // write data to register
+  Wire.endTransmission();           // end
+
+// ----------------- read compensation -----------------------------
+  byte  const TEMP_COMP  = 0x88;    // pointer to temperature compensation parameters
+  byte  const PRES_COMP  = 0x8E;    // pointer to pressure compensation parameters
+  addr = 0x76;                      // read first sensor
+  Wire.beginTransmission(addr);     // read temp compensation values
+  Wire.write(TEMP_COMP);            // Send register address to read from
+  if(Wire.endTransmission()==0) {  
+    Wire.requestFrom(addr, 6); // Request a block of data
+       dig_T1a = Wire.read() | (Wire.read()<<8);
+       dig_T2a = Wire.read() | (Wire.read()<<8);
+       dig_T3a = Wire.read() | (Wire.read()<<8); 
+  }
+  Wire.beginTransmission(addr);     // read pressure correction factors
+  Wire.write(PRES_COMP);            // Send register address to read from
+  if(Wire.endTransmission()==0) {  
+    Wire.requestFrom(addr, 18);// Request a block of data
+       dig_P1a = Wire.read() | (Wire.read()<<8);
+       dig_P2a = Wire.read() | (Wire.read()<<8);
+       dig_P3a = Wire.read() | (Wire.read()<<8);     
+       dig_P4a = Wire.read() | (Wire.read()<<8); 
+       dig_P5a = Wire.read() | (Wire.read()<<8); 
+       dig_P6a = Wire.read() | (Wire.read()<<8); 
+       dig_P7a = Wire.read() | (Wire.read()<<8); 
+       dig_P8a = Wire.read() | (Wire.read()<<8); 
+       dig_P9a = Wire.read() | (Wire.read()<<8); 
+  }
+  
+  addr = 0x77;                      // read second sensor
+  Wire.beginTransmission(addr);     // read temp compensation values
+  Wire.write(TEMP_COMP);            // Send register address to read from
+  if(Wire.endTransmission()==0) {  
+    Wire.requestFrom(addr, 6);      // Request a block of data
+       dig_T1b = Wire.read() | (Wire.read()<<8);
+       dig_T2b = Wire.read() | (Wire.read()<<8);
+       dig_T3b = Wire.read() | (Wire.read()<<8); 
+  }
+  Wire.beginTransmission(addr);     // read pressure correction factors
+  Wire.write(PRES_COMP);            // Send register address to read from
+  if(Wire.endTransmission()==0) {  
+    Wire.requestFrom(addr, 18);     // Request a block of data
+       dig_P1b = Wire.read() | (Wire.read()<<8);
+       dig_P2b = Wire.read() | (Wire.read()<<8);
+       dig_P3b = Wire.read() | (Wire.read()<<8);     
+       dig_P4b = Wire.read() | (Wire.read()<<8); 
+       dig_P5b = Wire.read() | (Wire.read()<<8); 
+       dig_P6b = Wire.read() | (Wire.read()<<8); 
+       dig_P7b = Wire.read() | (Wire.read()<<8); 
+       dig_P8b = Wire.read() | (Wire.read()<<8); 
+       dig_P9b = Wire.read() | (Wire.read()<<8); 
+  }
+  readBaro();                   // throw away - first reading is always bogus
+  readBaro();                   // throw away - just for good luck
+  printRawBaro();               // show
+  Pa = pa;                      // initialize averages for filter
+  Pb = pb;                      // initialize averages for filter
+}
+
+void printLocalTime() {
+  Serial.print(daysOfTheWeek[day]);
+  Serial.print(" ");
+  if(hours>12) Serial.print(hours-12);
+  else         Serial.print(hours);
+  Serial.print(":");
+  if(minutes<10) Serial.print("0");
+  Serial.print(minutes);
+  Serial.print(":");
+  if(seconds<10) Serial.print("0");
+  Serial.print(seconds);
+  if(hours>12) Serial.print(" PM");
+  else         Serial.print(" AM");
+  Serial.println();
+}
+
+void printRawBaro() {
+  Serial.print("Raw BMP data Ta ");
+  Serial.print(ta);
+  Serial.print(" Tb ");
+  Serial.print(tb);
+  Serial.print(" Pa ");
+  Serial.print(pa);
+  Serial.print(" Pb ");
+  Serial.print(pb);
+}
+
+void printAveBaro() {
+  Serial.print("Ave BMP data Ta ");
+  Serial.print(ta);
+  Serial.print(" Tb ");
+  Serial.print(tb);
+  Serial.print(" Pa ");
+  Serial.print(Pa);
+  Serial.print(" Pb ");
+  Serial.print(Pb);
+  Serial.println();
+}
+
+// -------------------------- Read Vcc -----------------------------
+void monitorVcc() {
+  vout = ESP.getVcc()*Vcal/1000.;// at 3.1V LiPo has ~10% capacity left
+  if(vout<VCCTHRES1) pwrOffTime=PWROFFTIME1; // if Vcc<3.2V, next sample in xx
+  if(vout<VCCTHRES2) pwrOffTime=PWROFFTIME2; // if Vcc<3.1V, next sample in xxx  
+  if(vout<VCCTHRES3) pwrOffTime=PWROFFTIME3; // if Vcc<3.1V, next sample in xxxx
+  Serial.print("Vcc ");         // each sample uses 80mA*5s/60s/m/60m/hour=.11mAH
+  Serial.print(vout);           // Voltage drop across XC660 ~120mV @ 70mA
+  Serial.println(" V");         // reading getVcc repeatedly seems to fail on ESP01  
+  Serial.print("Next sample in ");         // each sample uses 80mA*5s/60s/m/60m/hour=.11mAH
+  Serial.print(pwrOffTime);           // Voltage drop across XC660 ~120mV @ 70mA
+  Serial.println(" seconds");         // reading getVcc repeatedly seems to fail on ESP01  
+}
+
+// --------------------------- WiFi connect ---------------
+void connectWiFi() {
+  Serial.println();
+  Serial.print("Sampling...");  // connecting to WiFi
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1);                   // this will take ~3 sec
+    readBaro();                 // get baro, temp, vcc data while waiting
+    averageSamples();           // running ave of baro, temperature and vcc
+    samples++;                  // increment number of samples collected
+  }
+  Serial.print(samples);
+  Serial.println(" samples ");
+  validateSample();             // check baro for valid data and detect sensor "pop"
+  printAveBaro();
+  tout = ta;                    // use sensor a as temperature soource
+  Serial.println("WiFi Connected"); // WiFi connected
+}
+
+
+void setupTime() {
+  timeClient.begin();
+  configTime(utcOffset, daylightOffsetSec, ntpServer);
+  timeClient.update();              // keep alive
+  day = timeClient.getDay();        // get time of day info from internet
+  hours = timeClient.getHours();
+  minutes = timeClient.getMinutes();
+  seconds = timeClient.getSeconds();
+  printLocalTime();                 // show date/time
+}
+
+
+void setupSerial() {
+  Serial.begin(115200);         // report to serial monitor
+  delay(100);                   // minimum delay to begin printing
+  Serial.println();
+  Serial.println();
+}
