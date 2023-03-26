@@ -67,8 +67,8 @@ PubSubClient MQTTclient(mqtt_server, 1883, espClient);
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffset);
 
-const char* ssid = "Flyingeye";
-const char* password = "7192218822";
+const char* ssid = "xxx";
+const char* password = "xxx";
 const char* ntpServer = "pool.ntp.org";// time server
 char      msg[MSG_BUFFER_SIZE];
 char      daysOfTheWeek[7][12] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
@@ -155,8 +155,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
 }
 
 String MQTTclientId   = "ESP8266-";
-String MQTTclientUser = "stevensarns";
-String MQTTclientPw   = "Fe615243!";
+String MQTTclientUser = "xxx";
+String MQTTclientPw   = "xxx!";
 void reconnect() {
   while (!MQTTclient.connected()) {       // connect if not connected
     Serial.print("MQTT connection...");   // wait for connection
